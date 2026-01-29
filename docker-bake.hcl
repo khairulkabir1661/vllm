@@ -121,3 +121,21 @@ target "tpu" {
   ]
 
 }
+
+target "neuron" {
+  inherits = [ "_common" ]
+  dockerfile = "Dockerfile.neuron.ubi"
+
+  args = {
+    HWLOC_VERSION = "2.12.2"
+    NEURON_VERSION = "2.29"
+    PYTHON_VERSION = "${PYTHON_VERSION}"
+  }
+
+  tags = [
+    "${REPOSITORY}:${replace(VLLM_VERSION, "+", "_")}", # vllm_version might contain local version specifiers (+) which are not valid tags
+    "${REPOSITORY}:neuron-${GITHUB_SHA}",
+    "${REPOSITORY}:neuron-${GITHUB_RUN_ID}",
+    RELEASE_IMAGE ? "quay.io/vllm/vllm-neuron:${replace(VLLM_VERSION, "+", "_")}" : ""
+  ]
+}
