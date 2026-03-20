@@ -495,8 +495,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
                         fused_fp8_bmm_rope_cat_and_cache_mla,
                     )
+                    from aiter.ops.triton.fusions.fused_kv_cache import (
+                        fused_qk_rope_cat_and_cache_mla,
+                    )
 
                     self._fused_decode_kernel = fused_fp8_bmm_rope_cat_and_cache_mla
+                    self._fused_prefill_kernel = fused_qk_rope_cat_and_cache_mla
                     self._fused_kernel_type = "fp8"
                 except ImportError as e:
                     logger.warning_once(
@@ -512,6 +516,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 "AITER fused MLA decode kernel ENABLED: %s variant",
                 self._fused_kernel_type.upper(),
             )
+
+        # Enable prefill fusion (RoPE + KV cache write for prefill tokens)
+        # Requires decode fusion to be enabled
+        self.use_aiter_prefill_fused = (
+            self.use_aiter_fused and envs.VLLM_USE_AITER_PREFILL_FUSED
+        )
+
+        if self.use_aiter_prefill_fused:
+            logger.info("AITER fused MLA prefill kernel ENABLED (RoPE + KV cache)")
 
         # Attributes for forward_impl method
         self._vllm_config = get_current_vllm_config()
@@ -783,28 +796,72 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
                 prefill_positions = positions[num_mqa_tokens:]
 
-                # Apply RoPE to prefill tokens (q_pe part and k_pe)
-                # Note: rotary_emb returns NEW tensor for prefill_k_pe
-                # We use the new tensor directly, no write-back needed
+                # Apply RoPE and write KV cache for prefill tokens
                 if prefill_q.shape[0] > 0:  # Have prefill tokens
-                    prefill_q[..., self.qk_nope_head_dim :], prefill_k_pe = rotary_emb(
-                        prefill_positions,
-                        prefill_q[..., self.qk_nope_head_dim :],
-                        prefill_k_pe,
-                    )
-
-                    # Write prefill KV to cache (reuse extracted slices)
-                    if slot_mapping is not None:
+                    if self.use_aiter_prefill_fused and slot_mapping is not None:
+                        # FUSED PATH: RoPE + KV cache write in single kernel
                         prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
 
-                        self.impl.do_kv_cache_update(
-                            prefill_k_c_normed,
-                            prefill_k_pe,
-                            kv_cache,
-                            prefill_slot_mapping,
-                            self.kv_cache_dtype,
-                            self._k_scale,
+                        # Split Q into nope and pe components for fused kernel
+                        prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]
+                        prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+
+                        # Reshape K for fused kernel (same as decode path)
+                        # k_c_normed: [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
+                        prefill_k_nope_3d = prefill_k_c_normed.view(
+                            -1, self.num_kv_heads, self.kv_lora_rank
                         )
+                        prefill_k_pe_3d = prefill_k_pe.squeeze(1).view(
+                            -1, self.num_kv_heads, self.qk_rope_head_dim
+                        )
+
+                        # Call AITER fused kernel (RoPE + KV cache write)
+                        q_fused, _, k_pe_out, _ = self._fused_prefill_kernel(
+                            q_nope=prefill_q_nope,
+                            q_pe=prefill_q_pe,
+                            k_nope=prefill_k_nope_3d,
+                            k_pe=prefill_k_pe_3d,
+                            kv_cache=kv_cache,
+                            slot_mapping=prefill_slot_mapping,
+                            pos=prefill_positions,
+                            cos=self.cos_cache,
+                            sin=self.sin_cache,
+                            k_scale=self._k_scale,
+                            is_neox=self.is_neox_style,
+                            num_decode_toks_for_zeros=0,
+                            apply_scale=True,
+                            q_out_dtype=prefill_q.dtype,
+                        )
+
+                        # Update tensors with fused results
+                        # (RoPE applied to Q, KV cache written)
+                        prefill_q[:] = q_fused
+                        prefill_k_pe[:] = k_pe_out
+
+                    else:
+                        # UNFUSED PATH: Separate RoPE and KV cache write (fallback)
+                        # Note: rotary_emb returns NEW tensor for prefill_k_pe
+                        # We use the new tensor directly, no write-back needed
+                        prefill_q[..., self.qk_nope_head_dim :], prefill_k_pe = (
+                            rotary_emb(
+                                prefill_positions,
+                                prefill_q[..., self.qk_nope_head_dim :],
+                                prefill_k_pe,
+                            )
+                        )
+
+                        # Write prefill KV to cache (reuse extracted slices)
+                        if slot_mapping is not None:
+                            prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
+
+                            self.impl.do_kv_cache_update(
+                                prefill_k_c_normed,
+                                prefill_k_pe,
+                                kv_cache,
+                                prefill_slot_mapping,
+                                self.kv_cache_dtype,
+                                self._k_scale,
+                            )
 
             # Run prefill attention (reuse extracted slices)
             self.impl.forward_mha(
