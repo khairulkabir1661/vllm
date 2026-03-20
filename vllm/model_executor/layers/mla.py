@@ -235,6 +235,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                     prefix,
                 )
 
+        # VERIFICATION: Confirm all_mla_fused_mixed_batch branch is active
+        logger.warning("MLA.PY ALL_MLA_FUSED_MIXED_BATCH BRANCH ACTIVE - 2026-03-20")
+
     def forward(
         self,
         positions: torch.Tensor,
