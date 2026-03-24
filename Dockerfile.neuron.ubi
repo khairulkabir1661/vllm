@@ -1,0 +1,150 @@
+# syntax=docker/dockerfile:1
+# check=skip=InvalidDefaultArgInFrom # defaults are specified in bakefiles
+
+ARG BASE_UBI_IMAGE_TAG
+ARG PYTHON_VERSION
+
+## Base ########################################################################
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${BASE_UBI_IMAGE_TAG} AS base
+
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+RUN microdnf upgrade -y \
+    && microdnf install -y \
+        cmake \
+        gcc \
+        gcc-c++ \
+        git \
+        libxcrypt-compat \
+        python${PYTHON_VERSION}-pip \
+        python${PYTHON_VERSION}-wheel \
+    && microdnf clean all
+
+WORKDIR /workspace
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Some utils for dev purposes - tar required for kubectl cp
+RUN microdnf install -y \
+        findutils \
+        procps \
+        tar \
+        which \
+    && microdnf clean all
+
+## install hwloc from source ###################################################
+FROM base AS hwloc-builder
+
+ARG HWLOC_VERSION
+
+WORKDIR /src
+
+RUN microdnf install -y g++ gcc gzip tar wget
+
+RUN export SHORT_VERSION=$(echo ${HWLOC_VERSION} | cut -d'.' -f1-2) \
+    && wget https://download.open-mpi.org/release/hwloc/v$SHORT_VERSION/hwloc-${HWLOC_VERSION}.tar.gz \
+    && tar -xf hwloc-${HWLOC_VERSION}.tar.gz \
+    && rm hwloc-${HWLOC_VERSION}.tar.gz
+
+WORKDIR /src/hwloc-${HWLOC_VERSION}
+
+RUN ./configure \
+    && make -j \
+    && make install \
+    && rm -rf /src/hwloc-${HWLOC_VERSION}
+
+## Neuron ######################################################################
+FROM hwloc-builder AS neuron-base
+
+ARG NEURON_VERSION
+
+WORKDIR /workspace
+
+# TODO: better way to create the repo file than disjoint echos
+ENV REPO_FILE=/etc/yum.repos.d/neuron.repo
+# downloading the GPG file without import because:
+#   `microdnf install` works both ways (import, specified in repo file)
+#   `microdnf download` only works with gpgkey specified in repo file
+RUN curl -O https://yum.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB \
+    && echo "[neuron]" > "${REPO_FILE}" \
+    && echo "name=Neuron YUM Repository" >> "${REPO_FILE}" \
+    && echo "baseurl=https://yum.repos.neuron.amazonaws.com" >> "${REPO_FILE}" \
+    && echo "enabled=1" >> "${REPO_FILE}" \
+    && echo "metadata_expire=0" >> "${REPO_FILE}" \
+    && echo "gpgkey=file:///workspace/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB" >> "${REPO_FILE}" \
+    && rpm --import GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB
+
+# aws-neuronx-collectives-2.29.x requires "libatomic" and "hwloc-devel" and it
+# doesn't recognize the "hwloc" installed earlier so we install it separately
+# and without deps
+RUN microdnf download aws-neuronx-collectives-${NEURON_VERSION}.* \
+    && rpm -ivh --nodeps aws-neuronx-collectives*.rpm \
+    && rm -f aws-neuronx-collectives*.rpm
+
+# libatomic is a dependency of "aws-neuronx-collectives-2.29.x"
+RUN microdnf install -y --nobest \
+        aws-neuronx-runtime-lib-${NEURON_VERSION}.* \
+        aws-neuronx-tools-2.* \
+        libatomic \
+    && microdnf clean all
+
+## Python ######################################################################
+FROM neuron-base AS python-install
+
+ARG PYTHON_VERSION
+ENV UV_EXTRA_INDEX_URL=https://pip.repos.neuron.amazonaws.com
+ENV UV_INDEX_STRATEGY=unsafe-best-match
+
+ENV VIRTUAL_ENV=/opt/vllm
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+RUN microdnf install -y python${PYTHON_VERSION}-devel \
+    && python${PYTHON_VERSION} -m venv "$VIRTUAL_ENV" \
+    && pip install --no-cache -U pip wheel uv \
+    && microdnf clean all
+
+## Release #####################################################################
+FROM python-install AS vllm-openapi
+ARG PYTHON_VERSION
+
+WORKDIR /workspace
+ENV VIRTUAL_ENV=/opt/vllm
+ENV PATH="$VIRTUAL_ENV/bin:/opt/aws/neuron/bin:$PATH"
+ENV NEURON_RUNTIME_PATH=/opt/aws/neuron
+ENV LD_LIBRARY_PATH=/opt/aws/neuron/lib:/usr/lib64
+
+COPY LICENSE /licenses/vllm.md
+
+# install vllm (and any other dependencies) by running the payload script
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,src=payload,target=/workspace/payload \
+    ./payload/run.sh
+
+ENV HF_HUB_OFFLINE=1 \
+    HOME=/home/vllm \
+    VLLM_USAGE_STATS_SERVER=https://console.redhat.com/api/rhaiis-stats \
+    VLLM_USAGE_SOURCE=quay-docker-image \
+    VLLM_CACHE_ROOT=/tmp/vllm
+
+# setup non-root user for OpenShift
+RUN umask 002 && \
+    useradd --uid 2000 --gid 0 vllm && \
+    mkdir -p /home/vllm && \
+    chmod g+rwx /home/vllm
+
+# pre-download tiktoken/harmony tokenizer for disconnected environments
+# openai_harmony uses TIKTOKEN_RS_CACHE_DIR
+# while the python tiktoken module uses TIKTOKEN_CACHE_DIR
+ENV TIKTOKEN_CACHE_DIR=${HOME}/.cache/tiktoken
+ENV TIKTOKEN_RS_CACHE_DIR=${TIKTOKEN_CACHE_DIR}
+RUN --mount=type=bind,src=tools/predownload_tiktoken_tokenizers.py,target=predownload_tiktoken_tokenizers.py \
+    python predownload_tiktoken_tokenizers.py \
+    && chmod g+rwx "${TIKTOKEN_CACHE_DIR}" \
+    && chown -R vllm:0 ~/.cache
+
+USER 2000
+WORKDIR /home/vllm
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
