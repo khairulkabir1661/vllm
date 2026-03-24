@@ -747,14 +747,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             slot_mapping = attn_metadata.slot_mapping
 
         if num_mha_tokens > 0:
-            # Prefill path: handle prefill tokens using unfused Flash Attention
-            # STEP 3: Apply RoPE here for prefill tokens (FUSED PATH ONLY)
-
-            # Apply RoPE to prefill tokens ONLY if using fused path
-            # (unfused path already has RoPE from mla.py)
-            # Use STATIC flag (rotary_emb and positions always available
-            # per assumptions)
-            # Extract prefill slices once (used by both fused and unfused paths)
+            # Prefill path: Handle prefill tokens
+            # Extract prefill slices from batch tensors
             prefill_q = q[num_mqa_tokens:]
             prefill_k_c_normed = k_c_normed[num_mqa_tokens:]
             prefill_k_pe = k_pe[num_mqa_tokens:]
@@ -766,14 +760,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 and slot_mapping is not None
                 and prefill_q.shape[0] > 0
             ):
-                # FUSED PATH: RoPE + KV cache write in single kernel
-                # Apply RoPE to prefill tokens BEFORE KV cache write
-                # Problem: In mla.py, num_mqa_tokens from forward_context
-                # gets frozen in CUDA graph, causing wrong tokens to get
-                # RoPE (e.g., q[512:] vs q[1:])
-                # Solution: Apply RoPE here in forward_impl (outside CUDA
-                # graph) where num_mqa_tokens from attn_metadata is dynamic
-
+                # FUSED PATH: Use AITER fused kernel (RoPE + KV cache write)
+                # This is the optimized path that combines operations in one kernel
                 prefill_positions = positions[num_mqa_tokens:]
                 prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
 
