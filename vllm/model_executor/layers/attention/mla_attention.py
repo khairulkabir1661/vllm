@@ -916,7 +916,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
                 # Call fused kernel (applies RoPE internally AND writes
                 # to KV cache)
-                mqa_ql_nope, mqa_q_pe_rotated = self._run_atom_fused_decode(
+                mqa_ql_nope, mqa_q_pe_rotated = self._run_aiter_fused_decode(
                     mqa_q_nope,  # [num_heads, batch, qk_nope_head_dim]
                     mqa_q_pe,  # [batch, num_heads, qk_rope_head_dim]
                     mqa_k_c_normed,  # [batch, kv_lora_rank]
@@ -1014,7 +1014,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         return output_padded
 
-    def _run_atom_fused_decode(
+    def _run_aiter_fused_decode(
         self,
         mqa_q_nope: torch.Tensor,
         mqa_q_pe: torch.Tensor,
