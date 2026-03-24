@@ -742,24 +742,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # This is needed for both prefill and decode KV cache writes
         if slot_mapping is None and attn_metadata is not None:
             slot_mapping = attn_metadata.slot_mapping
-            # DEBUG: Commented out for performance
-            # logger.warning(
-            #     f"[MLA forward_impl] Retrieved slot_mapping from "
-            #     f"attn_metadata: "
-            #     f"shape={slot_mapping.shape if slot_mapping is not None "
-            #     f"else 'None'}, "
-            #     f"num_mqa_tokens={num_mqa_tokens}, "
-            #     f"num_mha_tokens={num_mha_tokens}"
-            # )
-
-        # DEBUG: Commented out for performance (runs every batch)
-        # logger.warning(
-        #     f"[MLA forward_impl] num_mqa_tokens={num_mqa_tokens}, "
-        #     f"num_mha_tokens={num_mha_tokens}, "
-        #     f"use_aiter_fused={self.use_aiter_fused}, "
-        #     f"slot_mapping={'None' if slot_mapping is None else "
-        #     f"slot_mapping.shape}"
-        # )
 
         if num_mha_tokens > 0:
             # Prefill path: handle prefill tokens using unfused Flash Attention
@@ -769,14 +751,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # (unfused path already has RoPE from mla.py)
             # Use STATIC flag (rotary_emb and positions always available
             # per assumptions)
-            # DEBUG: Commented out for performance (runs every batch)
-            # logger.warning(
-            #     f"[PREFILL CHECK] num_mha_tokens={num_mha_tokens}, "
-            #     f"use_aiter_fused={self.use_aiter_fused}, "
-            #     f"rotary_emb={'None' if rotary_emb is None else 'OK'}, "
-            #     f"positions={'None' if positions is None else "
-            #     f"positions.shape}"
-            # )
             # Extract prefill slices once (used by both fused and unfused paths)
             prefill_q = q[num_mqa_tokens:]
             prefill_k_c_normed = k_c_normed[num_mqa_tokens:]
@@ -807,7 +781,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
 
                         # Reshape K for fused kernel (same as decode path)
-                        # k_c_normed: [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
+                        # [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
                         prefill_k_nope_3d = prefill_k_c_normed.view(
                             -1, self.num_kv_heads, self.kv_lora_rank
                         )
@@ -940,20 +914,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     scope="local",
                 )
 
-                # Log AITER kernel inputs
-                # logger.warning(
-                #     f"[AITER DECODE INPUT] "
-                #     f"num_tokens={len(mqa_positions)}, "
-                #     f"positions="
-                #     f"{mqa_positions.tolist()[:min(5, len(mqa_positions))]}, "
-                #     f"k_pe_abs_max="
-                #     f"{mqa_k_pe.float().abs().max().item():.6e}, "
-                #     f"k_pe_first3={mqa_k_pe[0, 0, :3].tolist()}, "
-                #     f"slot_mapping="
-                #     f"{mqa_slot_mapping.tolist()[:min(5, "
-                #     f"len(mqa_slot_mapping))]}"
-                # )
-
                 # Call fused kernel (applies RoPE internally AND writes
                 # to KV cache)
                 mqa_ql_nope, mqa_q_pe_rotated = self._run_atom_fused_decode(
@@ -970,33 +930,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # KV cache was written by fused kernel (with RoPE)
                 # Assign to mqa_q_pe for subsequent concat/quant code
                 mqa_q_pe = mqa_q_pe_rotated
-
-                # DEBUG: Commented out for performance (runs every batch)
-                # logger.warning(
-                #     f"[DECODE KV] AITER kernel wrote "
-                #     f"{mqa_slot_mapping.shape[0]} decode tokens with RoPE"
-                # )
-
-                # Log AITER kernel outputs
-                # logger.warning(
-                #     f"[AITER DECODE OUTPUT] "
-                #     f"q_pe_rotated_abs_max="
-                #     f"{mqa_q_pe_rotated.float().abs().max().item():.6e}, "
-                #     f"ql_nope_abs_max="
-                #     f"{mqa_ql_nope.float().abs().max().item():.6e}"
-                # )
-
-                # VERIFY: Read back KV cache to verify fused decode
-                # write (EAGER MODE ONLY)
-                # COMMENTED OUT: Breaks execution
-                # if len(mqa_slot_mapping) > 0:
-                #     first_slot = mqa_slot_mapping[0].item()
-                #     kv_val = kv_cache[first_slot]
-                #     logger.warning(
-                #         f"[VERIFY FUSED DECODE KV] slot[0]={first_slot}, "
-                #         f"kv_cache: abs_max="
-                #         f"{kv_val.float().abs().max().item():.6e}"
-                #     )
 
             elif self.is_aiter_triton_fp4_bmm_enabled:
                 # UNFUSED PATH: RoPE already applied in mla.py
@@ -1114,33 +1047,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_nope_3d = k_c_normed.view(-1, self.num_kv_heads, self.kv_lora_rank)
         k_rope_3d = k_pe.squeeze(1).view(-1, self.num_kv_heads, self.qk_rope_head_dim)
 
-        # VERIFY: Log fused kernel inputs (EAGER MODE ONLY)
-        # COMMENTED OUT: Breaks torch compile / CUDA graph capture
-        # logger.warning(
-        #     f"[VERIFY FUSED IN] Shapes: "
-        #     f"q_nope={mqa_q_nope.shape}, q_pe={mqa_q_pe.shape}, "
-        #     f"k_nope={k_nope_3d.shape}, k_rope={k_rope_3d.shape}"
-        # )
-        # logger.warning(
-        #     f"[VERIFY FUSED IN] q_pe: abs_max="
-        #     f"{mqa_q_pe.float().abs().max().item():.6e}, "
-        #     f"first_3={mqa_q_pe[0,0,:3].tolist()}"
-        # )
-        # logger.warning(
-        #     f"[VERIFY FUSED IN] k_rope: abs_max="
-        #     f"{k_rope_3d.float().abs().max().item():.6e}, "
-        #     f"first_3={k_rope_3d[0,0,:3].tolist()}"
-        # )
-        # logger.warning(
-        #     f"[VERIFY FUSED IN] positions[0]={positions[0].item()}, "
-        #     f"slot[0]={slot_mapping[0].item()}"
-        # )
-        # logger.warning(
-        #     f"[VERIFY FUSED IN] W_K_scale={self.W_K_scale.item():.6e}, "
-        #     f"k_scale={self._k_scale.item():.6e}, "
-        #     f"q_nope: abs_max={mqa_q_nope.float().abs().max().item():.6e}"
-        # )
-
         # Call AITER fused kernel (FP4 or FP8 variant)
         if self._fused_kernel_type == "fp4":
             # FP4 variant has different parameters
@@ -1192,20 +1098,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # Split into components
         mqa_ql_nope = q_fused[..., : self.kv_lora_rank]
         mqa_q_pe_rotated = q_fused[..., self.kv_lora_rank :]
-
-        # VERIFY: Log fused kernel outputs (EAGER MODE ONLY)
-        # COMMENTED OUT: Breaks torch compile / CUDA graph capture
-        # logger.warning(
-        #     f"[VERIFY FUSED OUT] ql_nope shape={mqa_ql_nope.shape}, "
-        #     f"dtype={mqa_ql_nope.dtype}, "
-        #     f"abs_max={mqa_ql_nope.float().abs().max().item():.6e}"
-        # )
-        # logger.warning(
-        #     f"[VERIFY FUSED OUT] q_pe_rotated "
-        #     f"shape={mqa_q_pe_rotated.shape}, "
-        #     f"dtype={mqa_q_pe_rotated.dtype}, "
-        #     f"abs_max={mqa_q_pe_rotated.float().abs().max().item():.6e}"
-        # )
 
         return mqa_ql_nope, mqa_q_pe_rotated
 
