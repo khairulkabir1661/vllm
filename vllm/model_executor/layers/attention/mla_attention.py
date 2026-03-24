@@ -524,18 +524,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # Log when AITER fused kernels are enabled
         if self.use_aiter_fused:
             logger.info(
-                "AITER fused MLA decode kernel ENABLED: %s variant",
+                "AITER fused MLA kernels ENABLED: %s variant "
+                "(decode: BMM+RoPE+KV, prefill: RoPE+KV)",
                 self._fused_kernel_type.upper(),
             )
-
-        # Enable prefill fusion (RoPE + KV cache write for prefill tokens)
-        # Requires decode fusion to be enabled
-        self.use_aiter_prefill_fused = (
-            self.use_aiter_fused and envs.VLLM_USE_AITER_PREFILL_FUSED
-        )
-
-        if self.use_aiter_prefill_fused:
-            logger.info("AITER fused MLA prefill kernel ENABLED (RoPE + KV cache)")
 
         # Attributes for forward_impl method
         self._vllm_config = get_current_vllm_config()
@@ -783,7 +775,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
                 # Apply RoPE and write KV cache for prefill tokens
                 if prefill_q.shape[0] > 0:  # Have prefill tokens
-                    if self.use_aiter_prefill_fused and slot_mapping is not None:
+                    if slot_mapping is not None:
                         # FUSED PATH: RoPE + KV cache write in single kernel
                         prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
 
