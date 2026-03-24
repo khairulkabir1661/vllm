@@ -474,8 +474,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
 
         if self.use_aiter_fused:
-            # Choose FP4 or FP8 variant based on GPU support (ATOM pattern)
-            if self.is_aiter_triton_fp4_bmm_enabled:
+            # Import prefill kernel (shared between FP4 and FP8)
+            try:
+                from aiter.ops.triton.fusions.fused_kv_cache import (
+                    fused_qk_rope_cat_and_cache_mla,
+                )
+
+                self._fused_prefill_kernel = fused_qk_rope_cat_and_cache_mla
+            except ImportError as e:
+                logger.warning_once(
+                    f"AITER fused prefill kernel not available: {e}, "
+                    "falling back to separate ops",
+                    scope="local",
+                )
+                self.use_aiter_fused = False
+
+            # Choose FP4 or FP8 variant for decode based on GPU support
+            if self.use_aiter_fused and self.is_aiter_triton_fp4_bmm_enabled:
                 try:
                     from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
                         fused_fp4_bmm_rope_cat_and_cache_mla,
@@ -490,17 +505,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         scope="local",
                     )
                     self.use_aiter_fused = False
-            else:
+            elif self.use_aiter_fused:
                 try:
                     from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
                         fused_fp8_bmm_rope_cat_and_cache_mla,
                     )
-                    from aiter.ops.triton.fusions.fused_kv_cache import (
-                        fused_qk_rope_cat_and_cache_mla,
-                    )
 
                     self._fused_decode_kernel = fused_fp8_bmm_rope_cat_and_cache_mla
-                    self._fused_prefill_kernel = fused_qk_rope_cat_and_cache_mla
                     self._fused_kernel_type = "fp8"
                 except ImportError as e:
                     logger.warning_once(
