@@ -763,7 +763,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.use_aiter_fused
                 and rotary_emb is not None
                 and positions is not None
+                and slot_mapping is not None
+                and prefill_q.shape[0] > 0
             ):
+                # FUSED PATH: RoPE + KV cache write in single kernel
                 # Apply RoPE to prefill tokens BEFORE KV cache write
                 # Problem: In mla.py, num_mqa_tokens from forward_context
                 # gets frozen in CUDA graph, causing wrong tokens to get
@@ -772,73 +775,42 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # graph) where num_mqa_tokens from attn_metadata is dynamic
 
                 prefill_positions = positions[num_mqa_tokens:]
+                prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
 
-                # Apply RoPE and write KV cache for prefill tokens
-                if prefill_q.shape[0] > 0:  # Have prefill tokens
-                    if slot_mapping is not None:
-                        # FUSED PATH: RoPE + KV cache write in single kernel
-                        prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
+                # Split Q into nope and pe components for fused kernel
+                prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]
+                prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
 
-                        # Split Q into nope and pe components for fused kernel
-                        prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]
-                        prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+                # Reshape K for fused kernel
+                # [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
+                prefill_k_nope_3d = prefill_k_c_normed.view(
+                    -1, self.num_kv_heads, self.kv_lora_rank
+                )
+                prefill_k_pe_3d = prefill_k_pe.squeeze(1).view(
+                    -1, self.num_kv_heads, self.qk_rope_head_dim
+                )
 
-                        # Reshape K for fused kernel (same as decode path)
-                        # [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
-                        prefill_k_nope_3d = prefill_k_c_normed.view(
-                            -1, self.num_kv_heads, self.kv_lora_rank
-                        )
-                        prefill_k_pe_3d = prefill_k_pe.squeeze(1).view(
-                            -1, self.num_kv_heads, self.qk_rope_head_dim
-                        )
+                # Call AITER fused kernel (RoPE + KV cache write)
+                q_fused, _, k_pe_out, _ = self._fused_prefill_kernel(
+                    q_nope=prefill_q_nope,
+                    q_pe=prefill_q_pe,
+                    k_nope=prefill_k_nope_3d,
+                    k_pe=prefill_k_pe_3d,
+                    kv_cache=kv_cache,
+                    slot_mapping=prefill_slot_mapping,
+                    pos=prefill_positions,
+                    cos=self.cos_cache,
+                    sin=self.sin_cache,
+                    k_scale=self._k_scale,
+                    is_neox=self.is_neox_style,
+                    num_decode_toks_for_zeros=0,
+                    apply_scale=True,
+                    q_out_dtype=prefill_q.dtype,
+                )
 
-                        # Call AITER fused kernel (RoPE + KV cache write)
-                        q_fused, _, k_pe_out, _ = self._fused_prefill_kernel(
-                            q_nope=prefill_q_nope,
-                            q_pe=prefill_q_pe,
-                            k_nope=prefill_k_nope_3d,
-                            k_pe=prefill_k_pe_3d,
-                            kv_cache=kv_cache,
-                            slot_mapping=prefill_slot_mapping,
-                            pos=prefill_positions,
-                            cos=self.cos_cache,
-                            sin=self.sin_cache,
-                            k_scale=self._k_scale,
-                            is_neox=self.is_neox_style,
-                            num_decode_toks_for_zeros=0,
-                            apply_scale=True,
-                            q_out_dtype=prefill_q.dtype,
-                        )
-
-                        # Update tensors with fused results
-                        # (RoPE applied to Q, KV cache written)
-                        prefill_q[:] = q_fused
-                        prefill_k_pe[:] = k_pe_out
-
-                    else:
-                        # UNFUSED PATH: Separate RoPE and KV cache write (fallback)
-                        # Note: rotary_emb returns NEW tensor for prefill_k_pe
-                        # We use the new tensor directly, no write-back needed
-                        prefill_q[..., self.qk_nope_head_dim :], prefill_k_pe = (
-                            rotary_emb(
-                                prefill_positions,
-                                prefill_q[..., self.qk_nope_head_dim :],
-                                prefill_k_pe,
-                            )
-                        )
-
-                        # Write prefill KV to cache (reuse extracted slices)
-                        if slot_mapping is not None:
-                            prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
-
-                            self.impl.do_kv_cache_update(
-                                prefill_k_c_normed,
-                                prefill_k_pe,
-                                kv_cache,
-                                prefill_slot_mapping,
-                                self.kv_cache_dtype,
-                                self._k_scale,
-                            )
+                # Update tensors with fused results
+                prefill_q[:] = q_fused
+                prefill_k_pe[:] = k_pe_out
 
             # Run prefill attention (reuse extracted slices)
             self.impl.forward_mha(
