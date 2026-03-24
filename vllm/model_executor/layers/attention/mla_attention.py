@@ -424,12 +424,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        self.kv_cache = [
-            torch.tensor([])
-            for _ in range(
-                get_current_vllm_config().parallel_config.pipeline_parallel_size
-            )
-        ]
+        self.kv_cache = torch.tensor([])
 
         self.use_sparse = use_sparse
 
@@ -574,7 +569,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_metadata = forward_context.attn_metadata
             if isinstance(attn_metadata, dict):
                 attn_metadata = attn_metadata[self.layer_name]
-            self_kv_cache = self.kv_cache[0]
+            self_kv_cache = self.kv_cache
             slot_mapping = forward_context.slot_mapping
 
             assert isinstance(slot_mapping, dict), (
@@ -1368,7 +1363,7 @@ def unified_mla_kv_cache_update(
     #     "[unified_mla_kv_cache_update] UNFUSED path: writing all KV (num_tokens=%s)",
     #     kv_c_normed.shape[0],
     # )
-    kv_cache = attn_layer.kv_cache[0]
+    kv_cache = attn_layer.kv_cache
 
     slot_mapping = forward_context.slot_mapping
     assert isinstance(slot_mapping, dict), (
