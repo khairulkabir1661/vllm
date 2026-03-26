@@ -725,21 +725,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
-        # Fix positions tensor size to match actual batch
-        # positions may have extra padding that doesn't match q.size(0)
+        # Trim positions tensor to match actual batch size if needed
         if positions is not None:
             num_actual_tokens = q.size(0)
             if positions.size(0) > num_actual_tokens:
                 positions = positions[:num_actual_tokens]
 
         # Retrieve slot_mapping from attn_metadata if not provided
-        # This is needed for both prefill and decode KV cache writes
         if slot_mapping is None and attn_metadata is not None:
             slot_mapping = attn_metadata.slot_mapping
 
         if num_mha_tokens > 0:
-            # Prefill path: Handle prefill tokens
-            # Extract prefill slices from batch tensors
+            # Prefill path: extract prefill slices
             prefill_q = q[num_mqa_tokens:]
             prefill_k_c_normed = k_c_normed[num_mqa_tokens:]
             prefill_k_pe = k_pe[num_mqa_tokens:]
@@ -751,17 +748,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 and slot_mapping is not None
                 and prefill_q.shape[0] > 0
             ):
-                # FUSED PATH: Use AITER fused kernel (RoPE + KV cache write)
-                # This is the optimized path that combines operations in one kernel
+                # AITER fused prefill: RoPE + KV cache write in single kernel
                 prefill_positions = positions[num_mqa_tokens:]
                 prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
 
-                # Split Q into nope and pe components for fused kernel
+                # Split Q into nope and pe components
                 prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]
                 prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
 
-                # Reshape K for fused kernel
-                # [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
+                # Reshape K to [batch, num_kv_heads, head_dim]
                 prefill_k_nope_3d = prefill_k_c_normed.view(
                     -1, self.num_kv_heads, self.kv_lora_rank
                 )
@@ -769,7 +764,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     -1, self.num_kv_heads, self.qk_rope_head_dim
                 )
 
-                # Call AITER fused kernel (RoPE + KV cache write)
+                # AITER fused kernel applies RoPE and writes to KV cache
                 q_fused, _, k_pe_out, _ = self._fused_prefill_kernel(
                     q_nope=prefill_q_nope,
                     q_pe=prefill_q_pe,
@@ -787,11 +782,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     q_out_dtype=prefill_q.dtype,
                 )
 
-                # Update tensors with fused results
                 prefill_q[:] = q_fused
                 prefill_k_pe[:] = k_pe_out
 
-            # Run prefill attention (reuse extracted slices)
+            # Run prefill attention
             self.impl.forward_mha(
                 prefill_q,
                 prefill_k_c_normed,
@@ -803,11 +797,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if num_mqa_tokens > 0:
-            # Extract decode slices
+            # Decode path: extract decode slices
             mqa_q = q[:num_mqa_tokens]
             mqa_output_slice = output[:num_mqa_tokens]
 
-            # Extract additional decode slices for fused path
+            # Extract additional slices for AITER fused decode
             if self.use_aiter_fused and slot_mapping is not None:
                 mqa_k_c_normed = k_c_normed[:num_mqa_tokens]
                 mqa_k_pe = k_pe[:num_mqa_tokens]
