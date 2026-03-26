@@ -1319,10 +1319,8 @@ def unified_mla_kv_cache_update(
     k_scale: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Write KV cache for UNFUSED path only.
-    For fused path, KV cache writes happen in forward_impl:
-      - Prefill tokens: after RoPE applied (line 806)
-      - Decode tokens: in fused kernel (line 890+)
+    Writes KV cache for unfused path. For AITER fused path, returns early
+    (KV writes handled in forward_impl).
     Returns a dummy tensor to signal side effect for torch.compile ordering.
     """
     forward_context = get_forward_context()
