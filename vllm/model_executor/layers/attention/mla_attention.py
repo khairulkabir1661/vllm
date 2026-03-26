@@ -653,7 +653,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output_block_scale: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,  # For AITER fused kernel
         slot_mapping: torch.Tensor | None = None,  # For AITER fused kernel
-        rope_applied: bool | None = None,  # Whether RoPE was pre-applied in mla.py
         use_fused_path: bool
         | None = None,  # Single flag: use fused path for both prefill and decode
         rotary_emb: torch.nn.Module | None = None,  # RoPE module for fused path
@@ -661,12 +660,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         assert output is not None, "Output tensor must be provided."
 
         # If parameters not passed (from custom ops), derive from instance variables
-        if rope_applied is None:
-            rope_applied = not self.use_aiter_fused
         if use_fused_path is None:
             use_fused_path = self.use_aiter_fused
 
-        # Note: positions, slot_mapping, rope_applied, use_fused_path
+        # Note: positions, slot_mapping, use_fused_path
         # should be passed by caller
         # Direct call path: forward() passes them explicitly
         # Custom ops path: unified_mla_attention* retrieve from
@@ -1272,12 +1269,11 @@ def unified_mla_attention(
         scope="local",
     )
 
-    # Determine rope_applied and use_fused_path from layer config
+    # Determine use_fused_path from layer config
     # STATIC decision based on whether AITER kernels available
     # Assumptions: rotary_emb always exists, positions always provided
     # Therefore: use_aiter_fused is the sole deciding factor
     use_fused_path = layer.use_aiter_fused
-    rope_applied = not use_fused_path
 
     output = layer.forward_impl(
         q,
@@ -1287,7 +1283,6 @@ def unified_mla_attention(
         attn_metadata,
         positions=positions,
         slot_mapping=slot_mapping,
-        rope_applied=rope_applied,
         use_fused_path=use_fused_path,
         rotary_emb=rotary_emb,
     )
@@ -1438,21 +1433,11 @@ def unified_mla_attention_with_output(
     #     f"{'OK' if rotary_emb is not None else 'None'}"
     # )
 
-    # DEBUG: Commented out - logs once per worker (8x with TP8)
-    # logger.info_once(
-    #     "[custom op] PARAMETERS: positions=%s, slot_mapping=%s, layer=%s",
-    #     "exists" if positions is not None else "None",
-    #     "exists" if slot_mapping is not None else "None",
-    #     layer_name,
-    #     scope="local",
-    # )
-
     # Determine rope_applied and use_fused_path from layer config
     # STATIC decision based on whether AITER kernels available
     # Assumptions: rotary_emb always exists, positions always provided
     # Therefore: use_aiter_fused is the sole deciding factor
     use_fused_path = layer.use_aiter_fused
-    rope_applied = not use_fused_path
 
     layer.forward_impl(
         q,
@@ -1465,7 +1450,6 @@ def unified_mla_attention_with_output(
         output_block_scale=output_block_scale,
         positions=positions,
         slot_mapping=slot_mapping,
-        rope_applied=rope_applied,
         use_fused_path=use_fused_path,
         rotary_emb=rotary_emb,
     )
