@@ -945,60 +945,55 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             mqa_ql_nope: [batch, num_heads, kv_lora_rank]
             mqa_q_pe_rotated: [batch, num_heads, qk_rope_head_dim]
         """
-        # Reshape K for fused kernel
-        # k_c_normed: [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
+        # Reshape K to [batch, num_kv_heads, head_dim]
         k_nope_3d = k_c_normed.view(-1, self.num_kv_heads, self.kv_lora_rank)
         k_rope_3d = k_pe.squeeze(1).view(-1, self.num_kv_heads, self.qk_rope_head_dim)
 
-        # Call AITER fused kernel (FP4 or FP8 variant)
+        # Call FP4 or FP8 fused kernel
         if self._fused_kernel_type == "fp4":
-            # FP4 variant has different parameters
             q_fused, _, _, _ = self._fused_decode_kernel(
-                mqa_q_nope,  # [num_heads, batch, qk_nope_head_dim]
-                self.W_K,  # [num_heads, kv_lora_rank, qk_nope_head_dim] - FP4
-                self.W_K_scale,  # FP4 scale
-                mqa_q_pe,  # [batch, num_heads, qk_rope_head_dim] - NO RoPE!
-                k_nope_3d,  # [batch, num_kv_heads, kv_lora_rank]
-                k_rope_3d,  # [batch, num_kv_heads, qk_rope_head_dim] - NO RoPE!
-                kv_cache,  # KV cache tensor
-                slot_mapping,  # [batch]
-                positions,  # [batch]
-                self.cos_cache,  # RoPE cos cache
-                self.sin_cache,  # RoPE sin cache
-                y=None,  # FP4-specific
+                mqa_q_nope,
+                self.W_K,
+                self.W_K_scale,
+                mqa_q_pe,
+                k_nope_3d,
+                k_rope_3d,
+                kv_cache,
+                slot_mapping,
+                positions,
+                self.cos_cache,
+                self.sin_cache,
+                y=None,
                 transpose_bm=True,
-                prequant=True,  # FP4-specific
-                y_scale=None,  # FP4-specific
+                prequant=True,
+                y_scale=None,
                 k_scale=self._k_scale,
                 is_neox=self.is_neox_style,
-                q_out_dtype=mqa_q_nope.dtype,  # Match input dtype
+                q_out_dtype=mqa_q_nope.dtype,
                 num_decode_toks_for_zeros=0,
             )
         else:  # fp8
-            # FP8 variant has group_size parameter
             q_fused, _, _, _ = self._fused_decode_kernel(
-                mqa_q_nope,  # [num_heads, batch, qk_nope_head_dim]
-                self.W_K,  # [num_heads, kv_lora_rank, qk_nope_head_dim]
-                self.W_K_scale,  # [1,] - FP8 scale
-                mqa_q_pe,  # [batch, num_heads, qk_rope_head_dim]
-                k_nope_3d,  # [batch, num_kv_heads, kv_lora_rank]
-                k_rope_3d,  # [batch, num_kv_heads, qk_rope_head_dim]
-                kv_cache,  # KV cache tensor
-                slot_mapping,  # [batch]
-                positions,  # [batch]
-                self.cos_cache,  # RoPE cos cache
-                self.sin_cache,  # RoPE sin cache
-                group_size=128,  # FP8-specific
+                mqa_q_nope,
+                self.W_K,
+                self.W_K_scale,
+                mqa_q_pe,
+                k_nope_3d,
+                k_rope_3d,
+                kv_cache,
+                slot_mapping,
+                positions,
+                self.cos_cache,
+                self.sin_cache,
+                group_size=128,
                 transpose_bm=True,
                 k_scale=self._k_scale,
                 is_neox=self.is_neox_style,
-                q_out_dtype=mqa_q_nope.dtype,  # Match input dtype
+                q_out_dtype=mqa_q_nope.dtype,
                 num_decode_toks_for_zeros=0,
             )
 
-        # q_fused: [batch, num_heads, kv_lora_rank + qk_rope_head_dim]
-        # Contains both ql_nope and q_pe_rotated
-        # Split into components
+        # Split fused output into nope and rope components
         mqa_ql_nope = q_fused[..., : self.kv_lora_rank]
         mqa_q_pe_rotated = q_fused[..., self.kv_lora_rank :]
 
