@@ -1517,6 +1517,10 @@ except ImportError:
                 "MLA models using TRITON_MLA will require flash_attn. "
                 "AITER_MLA backends use aiter kernels instead."
             )
+    elif current_platform.is_xpu():
+        from vllm._xpu_ops import xpu_ops as ops
+
+        flash_attn_varlen_func = ops.flash_attn_varlen_func  # type: ignore[no-redef]
 
 
 def dynamic_per_batched_tensor_quant(
@@ -1594,10 +1598,12 @@ class MLACommonBackend(AttentionBackend):
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        # `stride_order` indicates the permutation that gets
-        # us from `get_kv_cache_shape` to the actual memory layout we want.
-        # (num_blocks, num_layers, block_size, head_size)
-        return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
+        if include_num_layers_dimension:
+            # MLA kernels require contiguous per-layer KV cache views.
+            # Identity permutation keeps num_layers first in physical
+            # layout, signaling cross-layer allocation is unsupported.
+            return (0, 1, 2, 3)
+        return (0, 1, 2)
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -1735,8 +1741,6 @@ def is_deepseek_r1_mla_compatible(vllm_config: VllmConfig) -> bool:
 
 @functools.cache
 def use_flashinfer_prefill() -> bool:
-    # For blackwell default to flashinfer prefill if it's available since
-    # it is faster than FA2.
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
@@ -1892,8 +1896,18 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         if use_fp8:
             fp8_dtype = current_platform.fp8_dtype()
+            logger.info_once(
+                "FP8 prefill attention enabled: query data type is FP8", scope="local"
+            )
             return fp8_dtype
         elif vllm_config.attention_config.use_prefill_query_quantization:
+            logger.info_once(
+                "Unable to perform FP8 prefill attention when"
+                " use_prefill_query_quantization is enabled. Please"
+                " ensure that --kv-cache-dtype is set to fp8 and your prefill"
+                " backend is compatible with FP8 attention.",
+                scope="local",
+            )
             return model_dtype
 
         return model_dtype
