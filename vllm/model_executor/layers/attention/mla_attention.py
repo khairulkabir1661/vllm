@@ -830,17 +830,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_q_pe = mqa_pe_padded
 
             # Compute positions from seq_lens if not provided
-            # For decode tokens, position = seq_lens - 1
-            # (current position in sequence)
-            # This matches the logic in prepare_pos_seq_lens_kernel
-            # where pos = num_computed_tokens
-            # and seq_len = num_computed_tokens + query_len,
-            # so pos = seq_len - query_len
-            # For decode (query_len=1): pos = seq_len - 1
+            # For decode: position = seq_lens - 1 (0-indexed current position)
             if positions is None and attn_metadata.decode is not None:
-                # Get decode sequence lengths for decode tokens only
                 decode_seq_lens = attn_metadata.decode.seq_lens
-                # Position is current sequence length - 1 (0-indexed)
                 positions = decode_seq_lens - 1
                 logger.info_once(
                     "[MLA] Computed positions from decode seq_lens: shape=%s",
@@ -848,28 +840,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     scope="local",
                 )
 
-            # CUDA graph compatible: Use STATIC flag
-            # self.use_aiter_fused is class attribute, same for all
-            # batches. num_mqa_tokens > 0 is dynamic but OK - PyTorch
-            # handles control flow in graphs
-
             if self.use_aiter_fused and slot_mapping is not None:
-                # FUSED PATH: Kernel applies RoPE internally AND writes to KV cache
-                # Decode slices already extracted above (lines 828-833)
-
-                # Type assertions for mypy
+                # AITER fused path: RoPE + KV cache write in kernel
                 assert positions is not None
                 assert slot_mapping is not None
 
-                # Log when fused kernel is being used
                 logger.info_once(
                     "Using AITER fused %s decode kernel for MLA",
                     self._fused_kernel_type.upper(),
                     scope="local",
                 )
 
-                # Call fused kernel (applies RoPE internally AND writes
-                # to KV cache)
+                # Fused kernel applies RoPE and writes to KV cache
                 mqa_ql_nope, mqa_q_pe_rotated = self._run_aiter_fused_decode(
                     mqa_q_nope,  # [num_heads, batch, qk_nope_head_dim]
                     mqa_q_pe,  # [batch, num_heads, qk_rope_head_dim]
@@ -879,17 +861,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_slot_mapping,
                     mqa_positions,
                 )
-                # Fused kernel output: mqa_ql_nope has BMM result,
-                # mqa_q_pe_rotated has RoPE applied
-                # KV cache was written by fused kernel (with RoPE)
-                # Assign to mqa_q_pe for subsequent concat/quant code
                 mqa_q_pe = mqa_q_pe_rotated
 
             elif self.is_aiter_triton_fp4_bmm_enabled:
-                # UNFUSED PATH: RoPE already applied in mla.py
-                # mqa_q_pe already has RoPE!
-                # Just do FP4 BMM (K = W_K @ kv_c_normed)
-                # logger.info("[MLA DECODE PATH] Using UNFUSED FP4 BMM")
+                # Unfused FP4 path: RoPE already applied in mla.py
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
                 mqa_ql_nope = batched_gemm_a16wfp4(
