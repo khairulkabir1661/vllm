@@ -302,11 +302,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         use_sparse: bool = False,
         indexer: object | None = None,
-        # RoPE caches for AITER fused kernels
+        # AITER fused kernel parameters
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         is_neox_style: bool = False,
-        # RoPE module (static, doesn't change)
         rotary_emb: torch.nn.Module | None = None,
         **extra_impl_args,
     ):
@@ -320,8 +319,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_lora_rank = kv_lora_rank
         self.kv_b_proj = kv_b_proj
         self.head_size = kv_lora_rank + qk_rope_head_dim
-        # Store rotary_emb module as class attribute
-        # (static, shared across all forwards)
         self.rotary_emb = rotary_emb
         self.layer_name = prefix
         self.indexer = indexer
