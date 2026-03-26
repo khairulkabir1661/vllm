@@ -454,16 +454,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.sin_cache = sin_cache
         self.is_neox_style = is_neox_style
 
-        # Detect if AITER fused decode kernel can be used (AMD GPU only)
-        # Support both FP4 and FP8 variants based on GPU capabilities
+        # Check if AITER fused kernels can be used
         self.use_aiter_fused = (
-            current_platform.is_rocm()  # AMD GPU only
+            current_platform.is_rocm()
             and (
                 self.is_aiter_triton_fp4_bmm_enabled
                 or self.is_aiter_triton_fp8_bmm_enabled
-            )  # FP4 or FP8 BMM available
-            and envs.VLLM_USE_AITER_FUSED  # Feature flag enabled
-            and cos_cache is not None  # RoPE caches available
+            )
+            and envs.VLLM_USE_AITER_FUSED
+            and cos_cache is not None
             and sin_cache is not None
         )
 
@@ -483,7 +482,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
                 self.use_aiter_fused = False
 
-            # Choose FP4 or FP8 variant for decode based on GPU support
+            # Import FP4 or FP8 decode kernel
             if self.use_aiter_fused and self.is_aiter_triton_fp4_bmm_enabled:
                 try:
                     from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
@@ -515,7 +514,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     )
                     self.use_aiter_fused = False
 
-        # Log when AITER fused kernels are enabled
         if self.use_aiter_fused:
             logger.info(
                 "AITER fused MLA kernels ENABLED: %s variant "
