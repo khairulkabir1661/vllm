@@ -2553,16 +2553,21 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
         if use_trtllm_ragged_deepseek_prefill():
+            logger.info_once(
+                "Using TRT-LLM ragged DeepSeek prefill for MLA", scope="local"
+            )
             self._run_prefill_context_chunk = (
                 self._run_prefill_context_chunk_trtllm_ragged
             )
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_trtllm_ragged
             self._pad_v = False
         elif use_flashinfer_prefill():
+            logger.info_once("Using FlashInfer prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fi
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fi
             self._pad_v = False
         elif use_cudnn_prefill():
+            logger.info_once("Using CUDNN prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_cudnn
             self._pad_v = False
@@ -2573,6 +2578,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     "available. Please install flash_attn or use "
                     "--attention-backend ROCM_AITER_MLA."
                 )
+            logger.info_once("Using FlashAttention prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fa
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fa
 
@@ -2591,13 +2597,16 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
             # For MLA the v head dim is smaller than qk head dim so we pad out
             # v with 0s to match the qk head dim for attention backends that do
-            # not support different headdims
-            # We don't need to pad V if we are on a hopper system with FA3
+            # not support different headdims.
+            # FA3 on Hopper (SM90) and FA4 natively handle diff headdims.
             device_capability = current_platform.get_device_capability()
             self._pad_v = self.vllm_flash_attn_version is None or not (
-                self.vllm_flash_attn_version == 3
-                and device_capability is not None
-                and device_capability[0] == 9
+                (
+                    self.vllm_flash_attn_version == 3
+                    and device_capability is not None
+                    and device_capability[0] == 9
+                )
+                or self.vllm_flash_attn_version == 4
             )
 
         self.dcp_world_size: int = -1
@@ -2928,11 +2937,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
             # When FP8 weights are used without FP8 prefill, kv_b_proj expects
             # model dtype input and will quantize internally.
-            if (
-                use_fp8_prefill
-                or self.kv_b_proj.weight.dtype != current_platform.fp8_dtype()
-            ):
-                kv_c_normed = kv_c_normed.to(self.kv_b_proj.weight.dtype)
+            # For quantized layers (AWQ/GPTQ) that lack a .weight attribute,
+            # use params_dtype which is the expected input dtype.
+            _kv_b_proj_w_dtype = (
+                self.kv_b_proj.weight.dtype
+                if hasattr(self.kv_b_proj, "weight")
+                else self.kv_b_proj.params_dtype
+            )
+            if use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype():
+                kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)
 
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
