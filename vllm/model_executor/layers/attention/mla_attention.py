@@ -1245,8 +1245,7 @@ def unified_mla_attention(
     del kv_cache_dummy_dep
     attn_metadata, layer, kv_cache, forward_context = get_attention_context(layer_name)
 
-    # positions and slot_mapping come from parameters (passed through compiled graph)
-    # rotary_emb retrieved from layer (stored as class attribute during __init__)
+    # Get rotary_emb from layer (stored during __init__)
     rotary_emb = layer.rotary_emb
 
     # Retrieve slot_mapping from forward_context or attn_metadata
@@ -1256,23 +1255,11 @@ def unified_mla_attention(
     ):
         slot_mapping = forward_context.slot_mapping.get(layer_name)
 
-    # Fallback: get slot_mapping from attn_metadata if not in forward_context
-    # This happens with torch.compile when forward_context doesn't persist
+    # Fallback to attn_metadata if not in forward_context
     if slot_mapping is None and attn_metadata is not None:
         slot_mapping = attn_metadata.slot_mapping
 
-    logger.info_once(
-        f"[unified_mla_attention] RETRIEVED: "
-        f"positions={'exists' if positions is not None else 'None'}, "
-        f"slot_mapping={'exists' if slot_mapping is not None else 'None'}, "
-        f"layer={layer_name}",
-        scope="local",
-    )
-
-    # Determine use_fused_path from layer config
-    # STATIC decision based on whether AITER kernels available
-    # Assumptions: rotary_emb always exists, positions always provided
-    # Therefore: use_aiter_fused is the sole deciding factor
+    # Use AITER fused path if available (static decision based on layer config)
     use_fused_path = layer.use_aiter_fused
 
     output = layer.forward_impl(
