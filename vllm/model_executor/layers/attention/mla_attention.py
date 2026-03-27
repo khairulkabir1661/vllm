@@ -1273,33 +1273,14 @@ def unified_mla_kv_cache_update(
 
     attn_layer = forward_context.no_compile_layers[layer_name]
 
-    # CUDA graph compatible: Use STATIC flag (set at __init__)
-    # Decision is based on whether AITER kernels are available, not per-batch metadata
-    # Assumptions: rotary_emb always exists, positions always provided
-    # Therefore: use_aiter_fused is the sole deciding factor (static)
+    # Check if AITER fused kernels are available (static decision)
     if attn_layer.use_aiter_fused:
-        # FUSED path (AITER kernels available):
-        # - mla.py applies RoPE only to prefill tokens (skips decode)
-        # - Skip KV write here, forward_impl handles it:
-        #   * Prefill: written in forward_impl after RoPE (line ~806)
-        #   * Decode: written in fused kernel (applies RoPE + writes KV)
-        # DEBUG: Commented out for performance (runs every batch)
-        # logger.warning(
-        #     "[unified_mla_kv_cache_update] FUSED path: skipping KV write "
-        #     "(num_tokens=%s)",
-        #     kv_c_normed.shape[0],
-        # )
+        # FUSED path: Skip KV write here, forward_impl handles it
+        # (Prefill: after RoPE, Decode: in fused kernel)
         return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
-    # UNFUSED path (no AITER kernels):
-    # - mla.py applies RoPE to ALL tokens
-    # - Write all tokens to KV cache here
-    # DEBUG: Commented out for performance (runs every batch)
-    # logger.warning(
-    #     "[unified_mla_kv_cache_update] UNFUSED path: writing all KV (num_tokens=%s)",
-    #     kv_c_normed.shape[0],
-    # )
-    kv_cache = attn_layer.kv_cache[0]
+    # UNFUSED path: Write all tokens to KV cache here
+    kv_cache = attn_layer.kv_cache
 
     slot_mapping = forward_context.slot_mapping
     assert isinstance(slot_mapping, dict), (
