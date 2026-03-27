@@ -1844,8 +1844,18 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         if use_fp8:
             fp8_dtype = current_platform.fp8_dtype()
+            logger.info_once(
+                "FP8 prefill attention enabled: query data type is FP8", scope="local"
+            )
             return fp8_dtype
         elif vllm_config.attention_config.use_prefill_query_quantization:
+            logger.info_once(
+                "Unable to perform FP8 prefill attention when"
+                " use_prefill_query_quantization is enabled. Please"
+                " ensure that --kv-cache-dtype is set to fp8 and your prefill"
+                " backend is compatible with FP8 attention.",
+                scope="local",
+            )
             return model_dtype
 
         return model_dtype
