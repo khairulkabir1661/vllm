@@ -642,26 +642,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,  # For AITER fused kernel
-        slot_mapping: torch.Tensor | None = None,  # For AITER fused kernel
-        rope_applied: bool | None = None,  # Whether RoPE was pre-applied in mla.py
-        use_fused_path: bool
-        | None = None,  # Single flag: use fused path for both prefill and decode
-        rotary_emb: torch.nn.Module | None = None,  # RoPE module for fused path
+        positions: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        rope_applied: bool | None = None,
+        use_fused_path: bool | None = None,
+        rotary_emb: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
-        # If parameters not passed (from custom ops), derive from instance variables
+        # Derive fusion flags from instance variables if not provided
         if rope_applied is None:
             rope_applied = not self.use_aiter_fused
         if use_fused_path is None:
             use_fused_path = self.use_aiter_fused
-
-        # Note: positions, slot_mapping, rope_applied, use_fused_path
-        # should be passed by caller
-        # Direct call path: forward() passes them explicitly
-        # Custom ops path: unified_mla_attention* retrieve from
-        # forward_context and pass them
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
