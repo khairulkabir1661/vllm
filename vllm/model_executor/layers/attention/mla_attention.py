@@ -590,17 +590,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
                 )
         else:
-            # Custom ops path (ROCm)
-            # For fused path: unified_mla_kv_cache_update skips write,
-            # forward_impl handles it
-            # For unfused path: unified_mla_kv_cache_update writes all
-            # tokens
-
-            # Ensure slot_mapping is in forward_context
+            # Custom ops path (ROCm AITER)
             if slot_mapping is not None:
                 forward_context.slot_mapping[self.layer_name] = slot_mapping
 
-            # KV cache update (skipped for fused path, handled for unfused)
             kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
                 kv_c_normed,
                 k_pe,
