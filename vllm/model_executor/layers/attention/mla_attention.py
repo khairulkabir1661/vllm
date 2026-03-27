@@ -731,8 +731,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if slot_mapping is None and attn_metadata is not None:
             slot_mapping = attn_metadata.slot_mapping
 
-        # UNIFIED ROPE+KV FUSION: Apply to entire batch BEFORE splitting
-        # This applies to ALL batches: decode-only, prefill-only, or mixed
+        # Apply unified RoPE+KV fusion to entire batch (decode + prefill)
         if (
             self.use_aiter_fused
             and self.use_aiter_rope_kv_fused
@@ -740,32 +739,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and positions is not None
             and slot_mapping is not None
         ):
-            # FUSED PATH: Single unified kernel call for entire batch
-            # Problem: In mla.py, num_mqa_tokens from forward_context
-            # gets frozen in CUDA graph, causing wrong tokens to get
-            # RoPE (e.g., q[512:] vs q[1:])
-            # Solution: Apply RoPE here in forward_impl (outside CUDA
-            # graph) where num_mqa_tokens from attn_metadata is dynamic
-
-            # Log when unified fusion is being used
+            # Single unified kernel call applies RoPE and writes KV cache
+            # for the entire batch. This must be done outside CUDA graph
+            # where num_mqa_tokens from attn_metadata is dynamically available.
             logger.info_once(
                 "Using AITER unified RoPE+KV fusion (single call) for entire batch",
                 scope="local",
             )
 
-            # Prepare whole batch tensors (don't split into decode/prefill)
             # Split Q into nope and pe components
             q_nope = q[..., : self.qk_nope_head_dim]
             q_pe = q[..., self.qk_nope_head_dim :]
 
-            # Reshape K for kernel
-            # k_c_normed: [batch, kv_lora_rank] -> [batch, num_kv_heads, kv_lora_rank]
+            # Reshape K: [batch, dim] -> [batch, num_kv_heads, dim]
             k_nope_3d = k_c_normed.view(-1, self.num_kv_heads, self.kv_lora_rank)
             k_pe_3d = k_pe.squeeze(1).view(-1, self.num_kv_heads, self.qk_rope_head_dim)
 
-            # SINGLE UNIFIED CALL for entire batch
-            # Key: num_decode_toks_for_zeros=num_mqa_tokens tells kernel
-            # to handle first num_mqa_tokens (decode) specially
+            # Call unified kernel for entire batch
+            # num_decode_toks_for_zeros tells kernel to handle first
+            # num_mqa_tokens specially
             q_fused, _, k_pe_out, _ = self._fused_rope_kv_kernel(
                 q_nope=q_nope,
                 q_pe=q_pe,
@@ -778,49 +770,39 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 sin=self.sin_cache,
                 k_scale=self._k_scale,
                 is_neox=self.is_neox_style,
-                num_decode_toks_for_zeros=num_mqa_tokens,  # KEY PARAMETER!
+                num_decode_toks_for_zeros=num_mqa_tokens,
                 apply_scale=True,
                 q_out_dtype=q.dtype,
             )
 
-            # Update tensors with fused results
-            # (RoPE applied to entire batch, KV cache written)
+            # Update tensors with fused results (RoPE applied, KV cache written)
             q[:] = q_fused
-            # k_pe_out: [batch, num_kv_heads=1, qk_rope_head_dim]
-            # k_pe: [batch, 1, qk_rope_head_dim]
-            # They match already (num_kv_heads=1 for MLA)
             k_pe[:] = k_pe_out
 
         if num_mha_tokens > 0:
-            # Prefill path: handle prefill tokens using unfused Flash Attention
-
-            # Extract prefill slices (used by both fused and unfused paths)
+            # Prefill path: process prefill tokens
             prefill_q = q[num_mqa_tokens:]
             prefill_k_c_normed = k_c_normed[num_mqa_tokens:]
             prefill_k_pe = k_pe[num_mqa_tokens:]
 
-            # UNFUSED PATH for prefill (if fused path wasn't used above)
+            # Apply RoPE and write KV cache if not using unified fusion
             if (
                 self.use_aiter_fused
                 and rotary_emb is not None
                 and positions is not None
                 and not (self.use_aiter_rope_kv_fused and slot_mapping is not None)
             ):
-                # UNFUSED PATH: Separate RoPE and KV cache write (fallback)
-                # Note: rotary_emb returns NEW tensor for prefill_k_pe
-                # We use the new tensor directly, no write-back needed
+                # Unfused path: apply RoPE separately
                 prefill_positions = positions[num_mqa_tokens:]
-
                 prefill_q[..., self.qk_nope_head_dim :], prefill_k_pe = rotary_emb(
                     prefill_positions,
                     prefill_q[..., self.qk_nope_head_dim :],
                     prefill_k_pe,
                 )
 
-                # Write prefill KV to cache (reuse extracted slices)
+                # Write prefill KV to cache
                 if slot_mapping is not None:
                     prefill_slot_mapping = slot_mapping[num_mqa_tokens:]
-
                     self.impl.do_kv_cache_update(
                         prefill_k_c_normed,
                         prefill_k_pe,
@@ -830,7 +812,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         self._k_scale,
                     )
 
-            # Run prefill attention (reuse extracted slices)
+            # Run prefill attention
             self.impl.forward_mha(
                 prefill_q,
                 prefill_k_c_normed,
