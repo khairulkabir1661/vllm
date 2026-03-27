@@ -1356,7 +1356,6 @@ def unified_mla_attention_with_output(
     del kv_cache_dummy_dep
     attn_metadata, layer, kv_cache, forward_context = get_attention_context(layer_name)
 
-    # positions and slot_mapping come from parameters (passed through compiled graph)
     # If slot_mapping is None, retrieve it from attn_metadata as fallback
     # (happens when called from mla.py which doesn't have slot_mapping)
     if (
@@ -1366,27 +1365,10 @@ def unified_mla_attention_with_output(
     ):
         slot_mapping = attn_metadata.slot_mapping
 
-    # positions and slot_mapping come from parameters (passed through compiled graph)
-    # rotary_emb retrieved from layer (stored as class attribute during __init__)
+    # Retrieve rotary_emb from layer (stored as class attribute during __init__)
     rotary_emb = layer.rotary_emb
-    # logger.warning(
-    #     f"[unified_mla_attention_with_output] Retrieved rotary_emb from layer: "
-    #     f"{'OK' if rotary_emb is not None else 'None'}"
-    # )
 
-    # DEBUG: Commented out - logs once per worker (8x with TP8)
-    # logger.info_once(
-    #     "[custom op] PARAMETERS: positions=%s, slot_mapping=%s, layer=%s",
-    #     "exists" if positions is not None else "None",
-    #     "exists" if slot_mapping is not None else "None",
-    #     layer_name,
-    #     scope="local",
-    # )
-
-    # Determine rope_applied and use_fused_path from layer config
-    # STATIC decision based on whether AITER kernels available
-    # Assumptions: rotary_emb always exists, positions always provided
-    # Therefore: use_aiter_fused is the sole deciding factor
+    # Determine whether to use AITER fused path based on layer config
     use_fused_path = layer.use_aiter_fused
     rope_applied = not use_fused_path
 
