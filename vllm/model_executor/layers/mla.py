@@ -82,22 +82,19 @@ def _fuse_rmsnorm_quant_impl(
 
     Uses @torch_compile_guard decorator for CUDA graph compatibility.
     """
-    # Call AITER's fused kernel
-    # Returns: ((out1_quantized, out1_bs), out1_unquantized, out2, out_res1)
     (q_c_quantized, q_c_scale), _, kv_c_normed, _ = fused_rms_fp8_group_quant(
-        q_c,  # x1: first input to normalize + quantize
-        q_a_layernorm_weight,  # x1_weight: RMSNorm weight for q_c
-        q_a_layernorm_variance_epsilon,  # x1_epsilon: epsilon for q_c
-        kv_c,  # x2: second input to normalize (no quant)
-        kv_a_layernorm_weight,  # x2_weight: RMSNorm weight for kv_c
-        kv_a_layernorm_variance_epsilon,  # x2_epsilon: epsilon for kv_c
-        group_size,  # group_size: 128 elements per group
-        dtype_quant,  # dtype_quant: dtypes.fp8
-        None,  # res1: no residual connection
-        output_unquantized_inp1,  # output_unquantized_inp1: False
-        transpose_scale,  # transpose_scale: True
+        q_c,
+        q_a_layernorm_weight,
+        q_a_layernorm_variance_epsilon,
+        kv_c,
+        kv_a_layernorm_weight,
+        kv_a_layernorm_variance_epsilon,
+        group_size,
+        dtype_quant,
+        None,
+        output_unquantized_inp1,
+        transpose_scale,
     )
-    # Return flattened tuple (ATOM pattern)
     return q_c_quantized, q_c_scale, kv_c_normed
 
 
@@ -231,11 +228,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
-        # VERIFICATION: Confirm all_mla_fused_mixed_batch branch is active
-        logger.warning("MLA.PY ALL_MLA_FUSED_MIXED_BATCH BRANCH ACTIVE - 2026-03-20")
-
-        # Determine if RMSNorm+Quant fusion should be enabled (ATOM pattern)
-        # Fusion is enabled when AITER is available and quantization is FP8
+        # Determine if RMSNorm+Quant fusion should be enabled
+        # Fusion requires AITER and FP8 quantization
         self.quant_config = quant_config
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
@@ -274,7 +268,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
-            # Step 1: QKV projection (use existing layer)
+            # QKV projection
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -284,10 +278,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
-            # Step 2: Apply RMSNorm and optional FP8 quantization (ATOM pattern)
-            # Fusion is enabled when fuse_qknorm_quant=True (AITER + FP8 quant)
+            # Apply RMSNorm and optional FP8 quantization fusion
             if self.fuse_qknorm_quant:
-                # Fused RMSNorm + FP8 quantization on q_c and kv_c
+                # Fused RMSNorm + FP8 quantization
                 q_c_quantized, q_c_scale, kv_c_normed = _fuse_rmsnorm_quant(
                     q_c,
                     self.q_a_layernorm.weight,
@@ -295,17 +288,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                     kv_c,
                     self.kv_a_layernorm.weight,
                     self.kv_a_layernorm.variance_epsilon,
-                    dtype_quant=self.quant_dtype,  # dtypes.fp8
+                    dtype_quant=self.quant_dtype,
                     group_size=128,
                     output_unquantized_inp1=False,
                     transpose_scale=True,
                 )
-                # Pass quantized tensor + scale as separate parameters
-                # (ATOM pattern). The layer will skip internal quantization
-                # and use the pre-quantized input.
                 q = self.q_b_proj(q_c_quantized, x_scale=q_c_scale)[0]
             else:
-                # Unfused path: standard RMSNorm without quantization
+                # Unfused path: standard RMSNorm
                 q_c = self.q_a_layernorm(q_c)
                 kv_c_normed = self.kv_a_layernorm(kv_c)
                 q = self.q_b_proj(q_c)[0]
@@ -328,64 +318,26 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        # VERIFY: Log mla.py outputs before RoPE (EAGER MODE ONLY)
-        # COMMENTED OUT: Breaks torch compile / CUDA graph capture
-        # from vllm.logger import init_logger
-        # logger = init_logger(__name__)
-        # logger.warning(
-        #     f"[VERIFY MLA] BEFORE RoPE: "
-        #     f"q: abs_max={q.float().abs().max().item():.6e}, "
-        #     f"first_3={q[0,0,:3].tolist()}, "
-        #     f"k_pe: abs_max={k_pe.float().abs().max().item():.6e}, "
-        #     f"first_3={k_pe[0,0,:3].tolist()}, "
-        #     f"kv_c_normed: abs_max="
-        #     f"{kv_c_normed.float().abs().max().item():.6e}, "
-        #     f"first_3={kv_c_normed[0,:3].tolist()}"
-        # )
-
-        # STEP 3: Determine if fused path can be used (SINGLE CHECK)
-        # Check all requirements once and use everywhere
+        # Determine if AITER fused RoPE+KV path can be used
         can_use_fused_path = (
             hasattr(self.mla_attn, "use_aiter_fused")
-            and self.mla_attn.use_aiter_fused  # Platform supports fused kernel
-            and positions is not None  # Required for RoPE
-            and self.rotary_emb is not None  # RoPE module available
+            and self.mla_attn.use_aiter_fused
+            and positions is not None
+            and self.rotary_emb is not None
         )
 
-        # Apply RoPE based on fused vs unfused path
+        # Apply RoPE if not using fused path
         if self.rotary_emb is not None:
             if can_use_fused_path:
-                # FUSED PATH: Skip RoPE here, unified kernel will apply it
-                # Branch: all_mla_fused_mixed_batch_2
-                # Architecture: Single unified RoPE+KV kernel for both prefill+decode
-                #   - Prefill: fused_qk_rope_cat_and_cache_mla (RoPE + KV cache)
-                #   - Decode: fused_qk_rope_cat_and_cache_mla (RoPE + KV cache)
-                #            then separate FP8/FP4 BMM
-                # Old architecture had BMM+RoPE+KV fusion for decode only
-                #
-                # Problem: num_decode_tokens retrieved from forward_context gets
-                # frozen as a constant when CUDA graph is captured, causing RoPE
-                # to be applied to wrong tokens (e.g., q[512:] instead of q[1:])
-                # Solution: Move RoPE to custom op (splitting op, not compiled)
-                # where attn_metadata.num_decode_tokens is available dynamically
+                # Fused path: RoPE applied in unified kernel
                 pass
             else:
-                # UNFUSED PATH: Apply RoPE to ALL tokens
+                # Unfused path: apply RoPE here
                 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                     positions,
-                    q[..., self.qk_nope_head_dim :],  # Q PE part gets RoPE
-                    k_pe,  # K PE gets RoPE
+                    q[..., self.qk_nope_head_dim :],
+                    k_pe,
                 )
-
-                # Log AFTER RoPE
-                # logger.warning(
-                #     f"[UNFUSED AFTER ROPE] "
-                #     f"q_pe_abs_max="
-                #     f"{q[..., self.qk_nope_head_dim:].float().abs().max()"
-                #     f".item():.6e}, "
-                #     f"k_pe_abs_max={k_pe.float().abs().max().item():.6e}, "
-                #     f"k_pe_after_first3={k_pe[0, 0, :3].tolist()}"
-                # )
 
         if self.indexer and self.is_sparse:
             _topk_indices = self.indexer(
@@ -395,25 +347,21 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if llama_4_scaling is not None:
             q *= llama_4_scaling
 
-        # STEP 4: Store rotary_emb in forward_context for custom ops
-        # positions is now passed as a parameter to custom ops (no longer
-        # stored in context). rotary_emb is still stored in context (not
-        # needed in compiled graph)
+        # Store rotary_emb in forward_context for custom ops
         from vllm.forward_context import get_forward_context
 
         forward_context = get_forward_context()
         if self.rotary_emb is not None:
             forward_context._rotary_emb = self.rotary_emb
 
-        # STEP 5: Pass to mla_attention
         attn_out = self.mla_attn(
-            q,  # Has RoPE if unfused, NO RoPE if fused
+            q,
             kv_c_normed,
-            k_pe,  # Has RoPE if unfused, NO RoPE if fused
+            k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             positions=positions,
-            slot_mapping=None,  # Retrieved from attn_metadata in mla_attention.py
-            use_fused_path=can_use_fused_path,  # Single flag for entire forward pass
+            slot_mapping=None,
+            use_fused_path=can_use_fused_path,
             rotary_emb=self.rotary_emb,
         )
 
