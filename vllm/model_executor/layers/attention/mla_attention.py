@@ -911,9 +911,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_q_nope = mqa_q_nope.transpose(0, 1)
 
             if self.is_aiter_triton_fp4_bmm_enabled:
-                # FP4 BMM: K = W_K @ kv_c_normed
-                # Note: RoPE may have been applied by unified kernel above,
-                # or pre-applied in mla.py (old unfused path)
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
                 mqa_ql_nope = batched_gemm_a16wfp4(
@@ -925,9 +922,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     y_scale=self._q_scale if fp8_attention else None,
                 )
             elif self.is_aiter_triton_fp8_bmm_enabled:
-                # FP8 BMM: (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
-                # Note: RoPE may have been applied by unified kernel above,
-                # or pre-applied in mla.py (old unfused path)
+                # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
                 mqa_ql_nope = rocm_aiter_ops.triton_fp8_bmm(
                     mqa_q_nope,
                     self.W_K,
