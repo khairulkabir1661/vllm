@@ -539,28 +539,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
-        positions: torch.Tensor | None = None,  # For AITER fused
-        slot_mapping: torch.Tensor | None = None,  # For custom ops
-        use_fused_path: bool = False,  # Use fused path
-        rotary_emb: torch.nn.Module | None = None,  # RoPE module
+        positions: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        use_fused_path: bool = False,
+        rotary_emb: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
 
-        # Store positions, rotary_emb, use_fused_path in forward_context
-        # for custom ops to retrieve
+        # Store AITER fusion parameters in forward_context for custom ops
         forward_context: ForwardContext = get_forward_context()
         if positions is not None:
             forward_context._positions = positions
-        # rotary_emb is now stored as class attribute (self.rotary_emb) during __init__
-        # No need to store in forward_context
         forward_context._use_fused_path = use_fused_path
 
         if self.use_direct_call:
             attn_metadata = forward_context.attn_metadata
             if isinstance(attn_metadata, dict):
                 attn_metadata = attn_metadata[self.layer_name]
-            self_kv_cache = self.kv_cache[0]
+            self_kv_cache = self.kv_cache
             slot_mapping = forward_context.slot_mapping
 
             assert isinstance(slot_mapping, dict), (
