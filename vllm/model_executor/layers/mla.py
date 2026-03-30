@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
 
-# Import AITER ops for fused RMSNorm + FP8 quantization
+# Try to import AITER ops for fused kernels
 try:
     from aiter import dtypes
     from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -38,7 +38,10 @@ def _fused_rms_fp8_group_quant_fake(
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fake implementation for torch.compile/CUDA graphs."""
+    """Fake implementation for torch.compile/CUDA graphs.
+
+    Returns tuple: (out1_quantized, out1_bs, out2)
+    """
     if dtype_quant is None:
         dtype_quant = dtypes.fp8
     m, n1 = q_c.shape
@@ -49,6 +52,7 @@ def _fused_rms_fp8_group_quant_fake(
     if transpose_scale:
         out1_bs = out1_bs.transpose(0, 1).contiguous().view(*out1_bs.shape)
     out2 = torch.empty_like(kv_c)
+    # Return tuple for ATOM-style pattern
     return out1_quantized, out1_bs, out2
 
 
@@ -64,13 +68,19 @@ def _fuse_rmsnorm_quant_impl(
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused dual RMSNorm + FP8 quantization using AITER.
+    """Fused dual RMSNorm + FP8 quantization using AITER (ATOM pattern).
 
-    Fuses RMSNorm on q_c with FP8 group quantization, and RMSNorm on kv_c
-    without quantization.
+    Fuses:
+    1. RMSNorm on q_c
+    2. FP8 group quantization on q_c
+    3. RMSNorm on kv_c (without quantization)
+
+    Based on ATOM's implementation in deepseek_v2.py:245-280
 
     Returns:
         (q_c_quantized, q_c_scale, kv_c_normed)
+
+    Uses @torch_compile_guard decorator for CUDA graph compatibility.
     """
     (q_c_quantized, q_c_scale), _, kv_c_normed, _ = fused_rms_fp8_group_quant(
         q_c,
@@ -170,6 +180,21 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
 
+        # Extract RoPE caches for AITER fused kernels
+        if self.rotary_emb is not None:
+            # RoPE stores combined cos_sin_cache, need to split it
+            # Format: [seq_len, rotary_dim] where first half is cos, second half is sin
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            rotary_dim = self.rotary_emb.rotary_dim
+            half_dim = rotary_dim // 2
+            self.cos_cache = cos_sin_cache[:, :half_dim]
+            self.sin_cache = cos_sin_cache[:, half_dim:]
+            self.is_neox_style = self.rotary_emb.is_neox_style
+        else:
+            self.cos_cache = None
+            self.sin_cache = None
+            self.is_neox_style = False
+
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
@@ -189,16 +214,24 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_b_proj=self.kv_b_proj,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            # Pass RoPE caches for AITER fused kernels
+            cos_cache=self.cos_cache,
+            sin_cache=self.sin_cache,
+            is_neox_style=self.is_neox_style,
+            # Pass RoPE module (static, doesn't change)
+            rotary_emb=self.rotary_emb,
         )
 
         self.prefix = prefix
 
-        # Enable RMSNorm+Quant fusion when AITER is available with FP8
+        # Determine if RMSNorm+Quant fusion should be enabled
+        # Fusion requires AITER and FP8 quantization
         self.quant_config = quant_config
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
 
         if _AITER_AVAILABLE and quant_config is not None:
+            # Check if quant_config is FP8
             from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
             if isinstance(quant_config, Fp8Config):
@@ -218,7 +251,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
-        q_c_scale = None  # Set when fuse_qknorm_quant is enabled
+        q_c_scale = None  # For FP8 quantized path
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -231,7 +264,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
-            # Step 1: QKV projection (use existing layer)
+            # QKV projection
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -241,7 +274,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
-            # Step 2: Apply RMSNorm and optional FP8 quantization
+            # Apply RMSNorm and optional FP8 quantization fusion
             if self.fuse_qknorm_quant:
                 # Fused RMSNorm + FP8 quantization
                 q_c_quantized, q_c_scale, kv_c_normed = _fuse_rmsnorm_quant(
@@ -258,7 +291,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 )
                 q = self.q_b_proj(q_c_quantized, x_scale=q_c_scale)[0]
             else:
-                # Unfused path: RMSNorm only
+                # Unfused path: standard RMSNorm
                 q_c = self.q_a_layernorm(q_c)
                 kv_c_normed = self.kv_a_layernorm(kv_c)
                 q = self.q_b_proj(q_c)[0]
@@ -277,13 +310,30 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
+
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
+        # Determine if AITER fused RoPE+KV path can be used
+        can_use_fused_path = (
+            hasattr(self.mla_attn, "use_aiter_fused")
+            and self.mla_attn.use_aiter_fused
+            and positions is not None
+            and self.rotary_emb is not None
+        )
+
+        # Apply RoPE if not using fused path
         if self.rotary_emb is not None:
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
+            if can_use_fused_path:
+                # Fused path: RoPE applied in unified kernel
+                pass
+            else:
+                # Unfused path: apply RoPE here
+                q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                    positions,
+                    q[..., self.qk_nope_head_dim :],
+                    k_pe,
+                )
 
         if self.indexer and self.is_sparse:
             _topk_indices = self.indexer(
@@ -293,11 +343,23 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if llama_4_scaling is not None:
             q *= llama_4_scaling
 
+        # Store rotary_emb in forward_context for custom ops
+        from vllm.forward_context import get_forward_context
+
+        forward_context = get_forward_context()
+        if self.rotary_emb is not None:
+            forward_context._rotary_emb = self.rotary_emb
+
         attn_out = self.mla_attn(
             q,
             kv_c_normed,
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+            positions=positions,
+            slot_mapping=None,
+            use_fused_path=can_use_fused_path,
+            rotary_emb=self.rotary_emb,
         )
 
-        return self.o_proj(attn_out)[0]
+        final_out = self.o_proj(attn_out)[0]
+        return final_out
